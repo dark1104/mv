@@ -1,0 +1,129 @@
+from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.table import StreamTableEnvironment, EnvironmentSettings
+from pyflink.common.serialization import SimpleStringSchema
+from pyflink.datastream.connectors.kafka import FlinkKafkaConsumer
+from pyflink.common.typeinfo import Types
+from pyflink.table.expressions import col
+
+import json
+from datetime import datetime
+import geoip2.database
+import geoip2.errors
+
+
+def enrich_record(value):
+    data = json.loads(value)
+
+    def to_ns(time_str):
+        return int(datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f").timestamp() * 1e9)
+
+    now = datetime.now()
+    data['date'] = now.strftime("%Y-%m-%d")
+    data['time_inserted_ns'] = to_ns(data['flow_start_time'])
+    data['time_received_ns'] = to_ns(data['flow_end_time'])
+
+    ip = data.get('sourceIPv4Address', '0.0.0.0')
+    try:
+        with geoip2.database.Reader('geolite/GeoLite2-ASN.mmdb') as asn_reader, \
+             geoip2.database.Reader('geolite/GeoLite2-City.mmdb') as city_reader, \
+             geoip2.database.Reader('geolite/GeoLite2-Country.mmdb') as country_reader:
+
+            data['asn_number'] = asn_reader.asn(ip).autonomous_system_number or 0
+            data['asn_organization'] = asn_reader.asn(ip).autonomous_system_organization or 'NA'
+            data['city_name'] = city_reader.city(ip).city.name or 'NA'
+            data['country_name'] = city_reader.country(ip).country.name or 'NA'
+            data['latitude'] = city_reader.city(ip).location.latitude or 0.0
+            data['longitude'] = city_reader.city(ip).location.longitude or 0.0
+            data['iso_code'] = country_reader.country(ip).country.iso_code or 'NA'
+
+    except geoip2.errors.AddressNotFoundError:
+        data['asn_number'] = 0
+        data['asn_organization'] = 'NA'
+        data['city_name'] = 'NA'
+        data['country_name'] = 'NA'
+        data['latitude'] = 0.0
+        data['longitude'] = 0.0
+        data['iso_code'] = 'NA'
+
+    return json.dumps(data)
+
+
+def main():
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+    settings = EnvironmentSettings.new_instance().in_streaming_mode().build()
+    t_env = StreamTableEnvironment.create(env, environment_settings=settings)
+
+    # Kafka Source
+    kafka_props = {
+        'bootstrap.servers': '192.168.91.37:9092',
+        'group.id': 'flink'
+    }
+
+    kafka_source = FlinkKafkaConsumer(
+        'flows',
+        SimpleStringSchema(),
+        kafka_props
+    )
+
+    stream = env.add_source(kafka_source).map(enrich_record, output_type=Types.STRING())
+
+    # Register DataStream as Table
+    t_env.create_temporary_view("enriched_flows", stream, col("value").alias("json"))
+
+    # Parse JSON inside Flink Table
+    t_env.execute_sql("""
+        CREATE TEMPORARY VIEW parsed_flows AS
+        SELECT
+            JSON_VALUE(json, '$.date') AS date,
+            CAST(JSON_VALUE(json, '$.time_inserted_ns') AS BIGINT) AS time_inserted_ns,
+            CAST(JSON_VALUE(json, '$.time_received_ns') AS BIGINT) AS time_received_ns,
+            JSON_VALUE(json, '$.sourceIPv4Address') AS sourceIPv4Address,
+            JSON_VALUE(json, '$.destinationIPv4Address') AS destinationIPv4Address,
+            CAST(JSON_VALUE(json, '$.protocolIdentifier') AS INT) AS protocolIdentifier,
+            JSON_VALUE(json, '$.protocolName') AS protocolName,
+            ...
+            CAST(JSON_VALUE(json, '$.asn_number') AS INT) AS asn_number,
+            JSON_VALUE(json, '$.asn_organization') AS asn_organization,
+            JSON_VALUE(json, '$.city_name') AS city_name,
+            JSON_VALUE(json, '$.country_name') AS country_name,
+            CAST(JSON_VALUE(json, '$.latitude') AS DOUBLE) AS latitude,
+            CAST(JSON_VALUE(json, '$.longitude') AS DOUBLE) AS longitude,
+            JSON_VALUE(json, '$.iso_code') AS iso_code
+        FROM enriched_flows
+    """)
+
+    # JDBC Sink to ClickHouse
+    t_env.execute_sql("""
+        CREATE TEMPORARY TABLE flows_raw_sink (
+            date STRING,
+            time_inserted_ns BIGINT,
+            time_received_ns BIGINT,
+            sourceIPv4Address STRING,
+            destinationIPv4Address STRING,
+            protocolIdentifier INT,
+            protocolName STRING,
+            ...
+            asn_number INT,
+            asn_organization STRING,
+            city_name STRING,
+            country_name STRING,
+            latitude DOUBLE,
+            longitude DOUBLE,
+            iso_code STRING
+        ) WITH (
+            'connector' = 'jdbc',
+            'url' = 'jdbc:clickhouse://172.27.0.6:8123/default',
+            'table-name' = 'flows_raw',
+            'driver' = 'com.clickhouse.jdbc.ClickHouseDriver',
+            'username' = 'default',
+            'password' = ''
+        )
+    """)
+
+    # Insert into ClickHouse
+    t_env.execute_sql("INSERT INTO flows_raw_sink SELECT * FROM parsed_flows")
+
+
+if __name__ == "__main__":
+    main()
