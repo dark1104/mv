@@ -1,126 +1,129 @@
-from pyflink.common import Configuration, Types
 from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.connectors.kafka import FlinkKafkaConsumer
+from pyflink.table import StreamTableEnvironment, EnvironmentSettings
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.table import StreamTableEnvironment, DataTypes, Schema, Row
-from pyflink.datastream.functions import MapFunction
+from pyflink.datastream.connectors.kafka import FlinkKafkaConsumer
+from pyflink.common.typeinfo import Types
+from pyflink.table.expressions import col
+
 import json
 from datetime import datetime
+import geoip2.database
+import geoip2.errors
 
-class JsonToRowMap(MapFunction):
-    def map(self, value):
-        data = json.loads(value)
-        return Row(
-            data.get("date", ""),
-            data.get("sourceIPv4Address", ""),
-            data.get("destinationIPv4Address", ""),
-            data.get("protocolName", ""),
-            data.get("sourceTransportPort", 0),
-            data.get("destinationTransportPort", 0),
-            data.get("octetDeltaCount", 0),
-            data.get("packetDeltaCount", 0),
-            data.get("flowStartMilliseconds", 0),
-            data.get("flowEndMilliseconds", 0),
-            data.get("mac_source", ""),
-            data.get("mac_destination", ""),
-            data.get("application_name", ""),
-            data.get("http_url", ""),
-            data.get("https_url_certificate", ""),
-            data.get("datalink_vlan", 0),
-            data.get("flow_start_time", ""),
-            data.get("flow_end_time", ""),
-            data.get("bytes_accumulated", 0),
-            data.get("tcp_retransmits", 0),
-            data.get("tcp_rst", 0),
-            data.get("tcp_fin", 0),
-            data.get("bytes_per_packet", 0.0),
-            data.get("flow_duration_ms", 0),
-            data.get("flow_direction", ""),
-            data.get("profile_name", "")
-        )
+
+def enrich_record(value):
+    data = json.loads(value)
+
+    def to_ns(time_str):
+        return int(datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f").timestamp() * 1e9)
+
+    now = datetime.now()
+    data['date'] = now.strftime("%Y-%m-%d")
+    data['time_inserted_ns'] = to_ns(data['flow_start_time'])
+    data['time_received_ns'] = to_ns(data['flow_end_time'])
+
+    ip = data.get('sourceIPv4Address', '0.0.0.0')
+    try:
+        with geoip2.database.Reader('geolite/GeoLite2-ASN.mmdb') as asn_reader, \
+             geoip2.database.Reader('geolite/GeoLite2-City.mmdb') as city_reader, \
+             geoip2.database.Reader('geolite/GeoLite2-Country.mmdb') as country_reader:
+
+            data['asn_number'] = asn_reader.asn(ip).autonomous_system_number or 0
+            data['asn_organization'] = asn_reader.asn(ip).autonomous_system_organization or 'NA'
+            data['city_name'] = city_reader.city(ip).city.name or 'NA'
+            data['country_name'] = city_reader.country(ip).country.name or 'NA'
+            data['latitude'] = city_reader.city(ip).location.latitude or 0.0
+            data['longitude'] = city_reader.city(ip).location.longitude or 0.0
+            data['iso_code'] = country_reader.country(ip).country.iso_code or 'NA'
+
+    except geoip2.errors.AddressNotFoundError:
+        data['asn_number'] = 0
+        data['asn_organization'] = 'NA'
+        data['city_name'] = 'NA'
+        data['country_name'] = 'NA'
+        data['latitude'] = 0.0
+        data['longitude'] = 0.0
+        data['iso_code'] = 'NA'
+
+    return json.dumps(data)
+
 
 def main():
-    config = Configuration()
-    config.set_string(
-        "pipeline.jars",
-        "file:///opt/flink/lib/flink-connector-kafka-1.17.1.jar,file:///opt/flink/lib/flink-sql-connector-clickhouse-1.17.1-9.jar"
-    )
-
     env = StreamExecutionEnvironment.get_execution_environment()
-    t_env = StreamTableEnvironment.create(env, environment_settings=None, configuration=config)
+    env.set_parallelism(1)
+    settings = EnvironmentSettings.new_instance().in_streaming_mode().build()
+    t_env = StreamTableEnvironment.create(env, environment_settings=settings)
 
-    properties = {
+    kafka_props = {
         'bootstrap.servers': '192.168.91.37:9092',
         'group.id': 'flink'
     }
 
-    consumer = FlinkKafkaConsumer(
+    kafka_source = FlinkKafkaConsumer(
         'flows',
         SimpleStringSchema(),
-        properties
+        kafka_props
     )
 
-    stream = env.add_source(consumer)
+    stream = env.add_source(kafka_source).map(enrich_record, output_type=Types.STRING())
 
-    typed_stream = stream.map(JsonToRowMap(), output_type=Types.ROW_NAMED(
-        ["date", "sourceIPv4Address", "destinationIPv4Address", "protocolName",
-         "sourceTransportPort", "destinationTransportPort", "octetDeltaCount", "packetDeltaCount",
-         "flowStartMilliseconds", "flowEndMilliseconds", "mac_source", "mac_destination",
-         "application_name", "http_url", "https_url_certificate", "datalink_vlan",
-         "flow_start_time", "flow_end_time", "bytes_accumulated", "tcp_retransmits",
-         "tcp_rst", "tcp_fin", "bytes_per_packet", "flow_duration_ms",
-         "flow_direction", "profile_name"],
-        [Types.STRING(), Types.STRING(), Types.STRING(), Types.STRING(),
-         Types.INT(), Types.INT(), Types.INT(), Types.INT(),
-         Types.LONG(), Types.LONG(), Types.STRING(), Types.STRING(),
-         Types.STRING(), Types.STRING(), Types.STRING(), Types.INT(),
-         Types.STRING(), Types.STRING(), Types.INT(), Types.INT(),
-         Types.INT(), Types.INT(), Types.FLOAT(), Types.INT(),
-         Types.STRING(), Types.STRING()]
-    ))
-
-    schema = Schema.new_builder() \
-        .column("date", DataTypes.STRING()) \
-        .column("sourceIPv4Address", DataTypes.STRING()) \
-        .column("destinationIPv4Address", DataTypes.STRING()) \
-        .column("protocolName", DataTypes.STRING()) \
-        .column("sourceTransportPort", DataTypes.INT()) \
-        .column("destinationTransportPort", DataTypes.INT()) \
-        .column("octetDeltaCount", DataTypes.INT()) \
-        .column("packetDeltaCount", DataTypes.INT()) \
-        .column("flowStartMilliseconds", DataTypes.BIGINT()) \
-        .column("flowEndMilliseconds", DataTypes.BIGINT()) \
-        .column("mac_source", DataTypes.STRING()) \
-        .column("mac_destination", DataTypes.STRING()) \
-        .column("application_name", DataTypes.STRING()) \
-        .column("http_url", DataTypes.STRING()) \
-        .column("https_url_certificate", DataTypes.STRING()) \
-        .column("datalink_vlan", DataTypes.INT()) \
-        .column("flow_start_time", DataTypes.STRING()) \
-        .column("flow_end_time", DataTypes.STRING()) \
-        .column("bytes_accumulated", DataTypes.INT()) \
-        .column("tcp_retransmits", DataTypes.INT()) \
-        .column("tcp_rst", DataTypes.INT()) \
-        .column("tcp_fin", DataTypes.INT()) \
-        .column("bytes_per_packet", DataTypes.FLOAT()) \
-        .column("flow_duration_ms", DataTypes.INT()) \
-        .column("flow_direction", DataTypes.STRING()) \
-        .column("profile_name", DataTypes.STRING()) \
-        .build()
-
-    table = t_env.from_data_stream(typed_stream, schema)
-    t_env.create_temporary_view("enriched_flows", table)
+    t_env.create_temporary_view("enriched_flows", stream, col("value").alias("json"))
 
     t_env.execute_sql("""
-        CREATE TABLE clickhouse_sink (
+        CREATE TEMPORARY VIEW parsed_flows AS
+        SELECT
+            JSON_VALUE(json, '$.date') AS date,
+            CAST(JSON_VALUE(json, '$.time_inserted_ns') AS BIGINT) AS time_inserted_ns,
+            CAST(JSON_VALUE(json, '$.time_received_ns') AS BIGINT) AS time_received_ns,
+            JSON_VALUE(json, '$.sourceIPv4Address') AS sourceIPv4Address,
+            JSON_VALUE(json, '$.destinationIPv4Address') AS destinationIPv4Address,
+            CAST(JSON_VALUE(json, '$.protocolIdentifier') AS INT) AS protocolIdentifier,
+            JSON_VALUE(json, '$.protocolName') AS protocolName,
+            CAST(JSON_VALUE(json, '$.sourceTransportPort') AS INT) AS sourceTransportPort,
+            CAST(JSON_VALUE(json, '$.destinationTransportPort') AS INT) AS destinationTransportPort,
+            CAST(JSON_VALUE(json, '$.octetDeltaCount') AS BIGINT) AS octetDeltaCount,
+            CAST(JSON_VALUE(json, '$.packetDeltaCount') AS BIGINT) AS packetDeltaCount,
+            CAST(JSON_VALUE(json, '$.flowStartMilliseconds') AS BIGINT) AS flowStartMilliseconds,
+            CAST(JSON_VALUE(json, '$.flowEndMilliseconds') AS BIGINT) AS flowEndMilliseconds,
+            JSON_VALUE(json, '$.mac_source') AS mac_source,
+            JSON_VALUE(json, '$.mac_destination') AS mac_destination,
+            JSON_VALUE(json, '$.application_name') AS application_name,
+            JSON_VALUE(json, '$.http_url') AS http_url,
+            JSON_VALUE(json, '$.https_url_certificate') AS https_url_certificate,
+            CAST(JSON_VALUE(json, '$.datalink_vlan') AS INT) AS datalink_vlan,
+            JSON_VALUE(json, '$.flow_start_time') AS flow_start_time,
+            JSON_VALUE(json, '$.flow_end_time') AS flow_end_time,
+            CAST(JSON_VALUE(json, '$.bytes_accumulated') AS BIGINT) AS bytes_accumulated,
+            CAST(JSON_VALUE(json, '$.tcp_retransmits') AS INT) AS tcp_retransmits,
+            CAST(JSON_VALUE(json, '$.tcp_rst') AS INT) AS tcp_rst,
+            CAST(JSON_VALUE(json, '$.tcp_fin') AS INT) AS tcp_fin,
+            CAST(JSON_VALUE(json, '$.bytes_per_packet') AS DOUBLE) AS bytes_per_packet,
+            CAST(JSON_VALUE(json, '$.flow_duration_ms') AS INT) AS flow_duration_ms,
+            JSON_VALUE(json, '$.flow_direction') AS flow_direction,
+            JSON_VALUE(json, '$.profile_name') AS profile_name,
+            CAST(JSON_VALUE(json, '$.asn_number') AS INT) AS asn_number,
+            JSON_VALUE(json, '$.asn_organization') AS asn_organization,
+            JSON_VALUE(json, '$.city_name') AS city_name,
+            JSON_VALUE(json, '$.country_name') AS country_name,
+            CAST(JSON_VALUE(json, '$.latitude') AS DOUBLE) AS latitude,
+            CAST(JSON_VALUE(json, '$.longitude') AS DOUBLE) AS longitude,
+            JSON_VALUE(json, '$.iso_code') AS iso_code
+        FROM enriched_flows
+    """)
+
+    t_env.execute_sql("""
+        CREATE TEMPORARY TABLE flows_raw_sink (
             date STRING,
+            time_inserted_ns BIGINT,
+            time_received_ns BIGINT,
             sourceIPv4Address STRING,
             destinationIPv4Address STRING,
+            protocolIdentifier INT,
             protocolName STRING,
             sourceTransportPort INT,
             destinationTransportPort INT,
-            octetDeltaCount INT,
-            packetDeltaCount INT,
+            octetDeltaCount BIGINT,
+            packetDeltaCount BIGINT,
             flowStartMilliseconds BIGINT,
             flowEndMilliseconds BIGINT,
             mac_source STRING,
@@ -131,30 +134,33 @@ def main():
             datalink_vlan INT,
             flow_start_time STRING,
             flow_end_time STRING,
-            bytes_accumulated INT,
+            bytes_accumulated BIGINT,
             tcp_retransmits INT,
             tcp_rst INT,
             tcp_fin INT,
-            bytes_per_packet FLOAT,
+            bytes_per_packet DOUBLE,
             flow_duration_ms INT,
             flow_direction STRING,
-            profile_name STRING
+            profile_name STRING,
+            asn_number INT,
+            asn_organization STRING,
+            city_name STRING,
+            country_name STRING,
+            latitude DOUBLE,
+            longitude DOUBLE,
+            iso_code STRING
         ) WITH (
-            'connector' = 'clickhouse',
+            'connector' = 'jdbc',
             'url' = 'jdbc:clickhouse://172.27.0.6:8123/default',
             'table-name' = 'flows_raw',
+            'driver' = 'com.clickhouse.jdbc.ClickHouseDriver',
             'username' = 'default',
-            'password' = '',
-            'sink.batch-size' = '1000',
-            'sink.flush-interval' = '1s',
-            'sink.max-retries' = '3'
+            'password' = ''
         )
     """)
 
-    t_env.execute_sql("""
-        INSERT INTO clickhouse_sink
-        SELECT * FROM enriched_flows
-    """)
+    t_env.execute_sql("INSERT INTO flows_raw_sink SELECT * FROM parsed_flows")
+
 
 if __name__ == "__main__":
     main()
