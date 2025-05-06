@@ -1,0 +1,133 @@
+from pyflink.common import Configuration
+from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.datastream.connectors.kafka import FlinkKafkaConsumer
+from pyflink.common.serialization import SimpleStringSchema
+from pyflink.table import StreamTableEnvironment
+from pyflink.datastream.functions import MapFunction, RuntimeContext
+
+import json
+
+
+class EnrichmentAndClickHouseWriter(MapFunction):
+    def open(self, runtime_context: RuntimeContext):
+        import geoip2.database
+        from clickhouse_driver import Client
+
+        self.asn_reader = geoip2.database.Reader('geolite/GeoLite2-ASN.mmdb')
+        self.city_reader = geoip2.database.Reader('geolite/GeoLite2-City.mmdb')
+        self.country_reader = geoip2.database.Reader('geolite/GeoLite2-Country.mmdb')
+        self.client = Client('172.27.0.6')  # Your ClickHouse IP
+
+    def map(self, value):
+        from datetime import datetime
+        import requests
+        import geoip2.errors
+
+        value = json.loads(value)
+
+        def convert_to_ns(time_str):
+            dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f")
+            return int(dt.timestamp() * 1e9)
+
+        def convert_to_datetime64(time_str):
+            return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f")
+
+        value['date'] = datetime.now().strftime("%Y-%m-%d")
+        value['time_inserted_ns'] = convert_to_ns(value['flow_start_time'])
+        value['time_received_ns'] = convert_to_ns(value['flow_end_time'])
+        value['flow_start_time'] = convert_to_datetime64(value['flow_start_time'])
+        value['flow_end_time'] = convert_to_datetime64(value['flow_end_time'])
+
+        ip_address = value['sourceIPv4Address']
+        try:
+            asn_response = self.asn_reader.asn(ip_address)
+            city_response = self.city_reader.city(ip_address)
+            country_response = self.country_reader.country(ip_address)
+
+            value['asn_number'] = asn_response.autonomous_system_number or 0
+            value['asn_organization'] = asn_response.autonomous_system_organization or 'NA'
+            value['city_name'] = city_response.city.name or 'NA'
+            value['country_name'] = city_response.country.name or 'NA'
+            value['latitude'] = city_response.location.latitude or 0.0
+            value['longitude'] = city_response.location.longitude or 0.0
+            value['iso_code'] = country_response.country.iso_code or 'NA'
+
+        except geoip2.errors.AddressNotFoundError:
+            value['asn_number'] = 0
+            value['asn_organization'] = 'NA'
+            value['city_name'] = 'NA'
+            value['country_name'] = 'NA'
+            value['latitude'] = 0.0
+            value['longitude'] = 0.0
+            value['iso_code'] = 'NA'
+
+        try:
+            response = requests.get("http://dummy.restapiexample.com/api/v1/employee/1")
+            if response.status_code == 200:
+                value['api_data'] = response.json()
+        except:
+            value['api_data'] = {}
+
+        insert_query = """
+        INSERT INTO flows_raw (
+            date, time_inserted_ns, time_received_ns,
+            sourceIPv4Address, destinationIPv4Address, protocolIdentifier, protocolName,
+            sourceTransportPort, destinationTransportPort,
+            octetDeltaCount, packetDeltaCount, flowStartMilliseconds, flowEndMilliseconds,
+            mac_source, mac_destination, application_name, http_url, https_url_certificate,
+            datalink_vlan, flow_start_time, flow_end_time,
+            bytes_accumulated, tcp_retransmits, tcp_rst, tcp_fin,
+            bytes_per_packet, flow_duration_ms, flow_direction, profile_name,
+            asn_number, asn_organization, city_name, country_name,
+            latitude, longitude, iso_code
+        ) VALUES (
+            %(date)s, %(time_inserted_ns)s, %(time_received_ns)s,
+            %(sourceIPv4Address)s, %(destinationIPv4Address)s, %(protocolIdentifier)s, %(protocolName)s,
+            %(sourceTransportPort)s, %(destinationTransportPort)s,
+            %(octetDeltaCount)s, %(packetDeltaCount)s, %(flowStartMilliseconds)s, %(flowEndMilliseconds)s,
+            %(mac_source)s, %(mac_destination)s, %(application_name)s, %(http_url)s, %(https_url_certificate)s,
+            %(datalink_vlan)s, %(flow_start_time)s, %(flow_end_time)s,
+            %(bytes_accumulated)s, %(tcp_retransmits)s, %(tcp_rst)s, %(tcp_fin)s,
+            %(bytes_per_packet)s, %(flow_duration_ms)s, %(flow_direction)s, %(profile_name)s,
+            %(asn_number)s, %(asn_organization)s, %(city_name)s, %(country_name)s,
+            %(latitude)s, %(longitude)s, %(iso_code)s
+        )
+        """
+        try:
+            self.client.execute(insert_query, value)
+        except Exception as e:
+            print(f"ClickHouse insert failed: {e}")
+
+        return json.dumps(value)  # return enriched JSON (optional)
+
+
+def enrichment_job():
+    config = Configuration()
+    config.set_string(
+        "pipeline.jars",
+        "file:///opt/flink/lib/flink-connector-kafka-1.17.1.jar"
+    )
+
+    env = StreamExecutionEnvironment.get_execution_environment()
+    env.set_parallelism(1)
+    t_env = StreamTableEnvironment.create(env)
+
+    properties = {
+        'bootstrap.servers': '192.168.91.37:9092',
+        'group.id': 'flink'
+    }
+
+    consumer = FlinkKafkaConsumer(
+        'flows',
+        SimpleStringSchema(),
+        properties
+    )
+
+    stream = env.add_source(consumer)
+    stream.map(EnrichmentAndClickHouseWriter())
+
+    env.execute("Data Enrichment and ClickHouse Sink Job")
+
+
+if __name__ == "__main__":
+    enrichment_job()
