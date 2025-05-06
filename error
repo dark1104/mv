@@ -1,0 +1,35 @@
+(flink-env) root@45ebe6d96661:/opt/flink# python enrichment_job_jdbc.py
+Traceback (most recent call last):
+  File "/opt/flink/enrichment_job_jdbc.py", line 166, in <module>
+    main()
+  File "/opt/flink/enrichment_job_jdbc.py", line 70, in main
+    t_env.create_temporary_view("enriched_flows", stream, col("value").alias("json"))
+  File "/opt/flink/flink-env/lib/python3.10/site-packages/pyflink/table/table_environment.py", line 1187, in create_temporary_view
+    self._j_tenv.createTemporaryView(
+  File "/opt/flink/flink-env/lib/python3.10/site-packages/py4j/java_gateway.py", line 1322, in __call__
+    return_value = get_return_value(
+  File "/opt/flink/flink-env/lib/python3.10/site-packages/pyflink/util/exceptions.py", line 146, in deco
+    return f(*a, **kw)
+  File "/opt/flink/flink-env/lib/python3.10/site-packages/py4j/protocol.py", line 326, in get_return_value
+    raise Py4JJavaError(
+py4j.protocol.Py4JJavaError: An error occurred while calling o19.createTemporaryView.
+: org.apache.flink.table.api.ValidationException: Field reference expression expected.
+        at org.apache.flink.table.typeutils.FieldInfoUtils.extractFieldInfoFromAtomicType(FieldInfoUtils.java:486)
+        at org.apache.flink.table.typeutils.FieldInfoUtils.extractFieldInformation(FieldInfoUtils.java:295)
+        at org.apache.flink.table.typeutils.FieldInfoUtils.getFieldsInfo(FieldInfoUtils.java:259)
+        at org.apache.flink.table.api.bridge.internal.AbstractStreamTableEnvironmentImpl.lambda$asQueryOperation$2(AbstractStreamTableEnvironmentImpl.java:287)
+        at java.base/java.util.Optional.map(Unknown Source)
+        at org.apache.flink.table.api.bridge.internal.AbstractStreamTableEnvironmentImpl.asQueryOperation(AbstractStreamTableEnvironmentImpl.java:284)
+        at org.apache.flink.table.api.bridge.java.internal.StreamTableEnvironmentImpl.fromDataStream(StreamTableEnvironmentImpl.java:297)
+        at org.apache.flink.table.api.bridge.java.internal.StreamTableEnvironmentImpl.createTemporaryView(StreamTableEnvironmentImpl.java:308)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(Unknown Source)
+        at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(Unknown Source)
+        at java.base/java.lang.reflect.Method.invoke(Unknown Source)
+        at org.apache.flink.api.python.shaded.py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+        at org.apache.flink.api.python.shaded.py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:374)
+        at org.apache.flink.api.python.shaded.py4j.Gateway.invoke(Gateway.java:282)
+        at org.apache.flink.api.python.shaded.py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+        at org.apache.flink.api.python.shaded.py4j.commands.CallCommand.execute(CallCommand.java:79)
+        at org.apache.flink.api.python.shaded.py4j.GatewayConnection.run(GatewayConnection.java:238)
+        at java.base/java.lang.Thread.run(Unknown Source)
