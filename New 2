@@ -66,12 +66,11 @@ class EnrichmentMapFunction(MapFunction):
         return json.dumps(value)
 
 
-class ClickHouseSinkFunction(SinkFunction):
-    def open(self, runtime_context: RuntimeContext):
-        from clickhouse_driver import Client
-        self.client = Client('172.27.0.6')
-
+class ClickHouseSink(SinkFunction):
     def invoke(self, value, context):
+        from clickhouse_driver import Client
+        import json
+        client = Client('172.27.0.6')
         data = json.loads(value)
         insert_query = """
         INSERT INTO flows_raw (
@@ -98,7 +97,7 @@ class ClickHouseSinkFunction(SinkFunction):
             %(latitude)s, %(longitude)s, %(iso_code)s
         )
         """
-        self.client.execute(insert_query, data)
+        client.execute(insert_query, data)
 
 
 def enrichment_job():
@@ -125,8 +124,8 @@ def enrichment_job():
 
     stream = env.add_source(consumer)
     enriched_stream = stream.map(EnrichmentMapFunction())
-    enriched_stream.add_sink(ClickHouseSinkFunction())
-
+    enriched_stream.add_sink(ClickHouseSink())
+    
     env.execute("Data Enrichment Job")
 
 
