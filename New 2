@@ -5,8 +5,8 @@ from pyflink.common.serialization import SimpleStringSchema
 from pyflink.table import StreamTableEnvironment
 from pyflink.datastream.functions import MapFunction, SinkFunction, RuntimeContext
 
-from clickhouse_driver import Client
 import json
+
 
 class EnrichmentMapFunction(MapFunction):
     def open(self, runtime_context: RuntimeContext):
@@ -16,7 +16,6 @@ class EnrichmentMapFunction(MapFunction):
         self.country_reader = geoip2.database.Reader('geolite/GeoLite2-Country.mmdb')
 
     def map(self, value):
-        import json
         from datetime import datetime
         import requests
         import geoip2.errors
@@ -66,38 +65,37 @@ class EnrichmentMapFunction(MapFunction):
         return json.dumps(value)
 
 
-class ClickHouseSink(SinkFunction):
-    def invoke(self, value, context):
-        from clickhouse_driver import Client
-        import json
-        client = Client('172.27.0.6')
-        data = json.loads(value)
-        insert_query = """
-        INSERT INTO flows_raw (
-            date, time_inserted_ns, time_received_ns,
-            sourceIPv4Address, destinationIPv4Address, protocolIdentifier, protocolName,
-            sourceTransportPort, destinationTransportPort,
-            octetDeltaCount, packetDeltaCount, flowStartMilliseconds, flowEndMilliseconds,
-            mac_source, mac_destination, application_name, http_url, https_url_certificate,
-            datalink_vlan, flow_start_time, flow_end_time,
-            bytes_accumulated, tcp_retransmits, tcp_rst, tcp_fin,
-            bytes_per_packet, flow_duration_ms, flow_direction, profile_name,
-            asn_number, asn_organization, city_name, country_name,
-            latitude, longitude, iso_code
-        ) VALUES (
-            %(date)s, %(time_inserted_ns)s, %(time_received_ns)s,
-            %(sourceIPv4Address)s, %(destinationIPv4Address)s, %(protocolIdentifier)s, %(protocolName)s,
-            %(sourceTransportPort)s, %(destinationTransportPort)s,
-            %(octetDeltaCount)s, %(packetDeltaCount)s, %(flowStartMilliseconds)s, %(flowEndMilliseconds)s,
-            %(mac_source)s, %(mac_destination)s, %(application_name)s, %(http_url)s, %(https_url_certificate)s,
-            %(datalink_vlan)s, %(flow_start_time)s, %(flow_end_time)s,
-            %(bytes_accumulated)s, %(tcp_retransmits)s, %(tcp_rst)s, %(tcp_fin)s,
-            %(bytes_per_packet)s, %(flow_duration_ms)s, %(flow_direction)s, %(profile_name)s,
-            %(asn_number)s, %(asn_organization)s, %(city_name)s, %(country_name)s,
-            %(latitude)s, %(longitude)s, %(iso_code)s
-        )
-        """
-        client.execute(insert_query, data)
+# Define the function that will be wrapped by SinkFunction
+def clickhouse_sink_function(value):
+    from clickhouse_driver import Client
+    client = Client('172.27.0.6')
+    data = json.loads(value)
+    insert_query = """
+    INSERT INTO flows_raw (
+        date, time_inserted_ns, time_received_ns,
+        sourceIPv4Address, destinationIPv4Address, protocolIdentifier, protocolName,
+        sourceTransportPort, destinationTransportPort,
+        octetDeltaCount, packetDeltaCount, flowStartMilliseconds, flowEndMilliseconds,
+        mac_source, mac_destination, application_name, http_url, https_url_certificate,
+        datalink_vlan, flow_start_time, flow_end_time,
+        bytes_accumulated, tcp_retransmits, tcp_rst, tcp_fin,
+        bytes_per_packet, flow_duration_ms, flow_direction, profile_name,
+        asn_number, asn_organization, city_name, country_name,
+        latitude, longitude, iso_code
+    ) VALUES (
+        %(date)s, %(time_inserted_ns)s, %(time_received_ns)s,
+        %(sourceIPv4Address)s, %(destinationIPv4Address)s, %(protocolIdentifier)s, %(protocolName)s,
+        %(sourceTransportPort)s, %(destinationTransportPort)s,
+        %(octetDeltaCount)s, %(packetDeltaCount)s, %(flowStartMilliseconds)s, %(flowEndMilliseconds)s,
+        %(mac_source)s, %(mac_destination)s, %(application_name)s, %(http_url)s, %(https_url_certificate)s,
+        %(datalink_vlan)s, %(flow_start_time)s, %(flow_end_time)s,
+        %(bytes_accumulated)s, %(tcp_retransmits)s, %(tcp_rst)s, %(tcp_fin)s,
+        %(bytes_per_packet)s, %(flow_duration_ms)s, %(flow_direction)s, %(profile_name)s,
+        %(asn_number)s, %(asn_organization)s, %(city_name)s, %(country_name)s,
+        %(latitude)s, %(longitude)s, %(iso_code)s
+    )
+    """
+    client.execute(insert_query, data)
 
 
 def enrichment_job():
@@ -124,8 +122,10 @@ def enrichment_job():
 
     stream = env.add_source(consumer)
     enriched_stream = stream.map(EnrichmentMapFunction())
-    enriched_stream.add_sink(ClickHouseSink())
-    
+
+    # Wrap the Python function using SinkFunction
+    enriched_stream.add_sink(SinkFunction(clickhouse_sink_function))
+
     env.execute("Data Enrichment Job")
 
 
